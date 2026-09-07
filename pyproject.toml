@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "random-streetview"
+version = "0.1.0"
+description = "One call, one random Google Street View panorama"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "AngLaboratory", email = "anglaboratory@gmail.com" }]
+keywords = [
+    "streetview",
+    "street-view",
+    "google-street-view",
+    "random",
+    "panorama",
+    "panoid",
+    "geoguessr",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Multimedia :: Graphics",
+    "Typing :: Typed",
+]
+dependencies = ["requests>=2.25"]
+
+[project.urls]
+Homepage = "https://github.com/AngLaboratory/random-streetview"
+Source = "https://github.com/AngLaboratory/random-streetview"
+Issues = "https://github.com/AngLaboratory/random-streetview/issues"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/random_streetview"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

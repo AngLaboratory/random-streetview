@@ -1,0 +1,26 @@
+name: Publish
+
+# Publishes to PyPI when a GitHub release is created.
+# Uses PyPI Trusted Publishing (OIDC), so no API token is stored here --
+# configure the publisher once at
+# https://pypi.org/manage/project/random-streetview/settings/publishing/
+#   Owner: AngLaboratory   Repository: random-streetview
+#   Workflow: publish.yml  Environment: pypi
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - run: uvx twine check dist/*
+      - uses: pypa/gh-action-pypi-publish@release/v1
