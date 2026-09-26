@@ -3,7 +3,8 @@
 [![PyPI](https://img.shields.io/pypi/v/random-streetview)](https://pypi.org/project/random-streetview/)
 [![Python](https://img.shields.io/pypi/pyversions/random-streetview)](https://pypi.org/project/random-streetview/)
 
-One call, one random Google Street View panorama.
+One call, one random Street View panorama. Google is worldwide and the
+default; Naver and Kakao return road-view panoramas from South Korea.
 
 ```bash
 pip install random-streetview
@@ -14,16 +15,35 @@ from random_streetview import random_panorama
 
 pano = random_panorama()
 
-pano.id     # 'ptFCsB5aFyaWDDlpbCliVw'
-pano.lon    # 2.2954822
-pano.lat    # 48.8583758
-pano.url    # 'https://www.google.com/maps/@?api=1&map_action=pano&pano=...'
+pano.id       # 'ptFCsB5aFyaWDDlpbCliVw'
+pano.lon      # 2.2954822
+pano.lat      # 48.8583758
+pano.platform # 'google'
+pano.url      # 'https://www.google.com/maps/@?api=1&map_action=pano&pano=...'
 ```
 
-`Panorama` is a named tuple, so `panoid, lon, lat = random_panorama()` works too.
+`Panorama` is a named tuple, so `panoid, lon, lat, platform = random_panorama()`
+works too (`platform` defaults to `'google'` when constructed directly).
 
 Nothing raises on a network or parsing failure — you get `None` once the
 attempts are used up.
+
+## Platforms
+
+```python
+random_panorama()                     # Google, worldwide (default)
+random_panorama(platform="naver")     # Naver, South Korea
+random_panorama(platform="kakao")     # Kakao, South Korea
+```
+
+`platform` is one of `"google"`, `"naver"`, `"kakao"`; anything else raises
+`ValueError`. `pano.platform` records which one produced the result, and
+`pano.url` builds the matching map link.
+
+Naver and Kakao only cover South Korea, so their candidate coordinates are
+drawn from inland Korea rather than the worldwide lists Google uses. Both hit
+undocumented internal map endpoints — same no-key, no-guarantees caveat as
+Google below — and return `None` rather than raising when they come up empty.
 
 ## Timeouts
 
