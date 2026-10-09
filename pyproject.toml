@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "random-streetview"
-version = "0.2.0"
+version = "0.3.0"
 description = "One call, one random Street View panorama (Google, Naver, Kakao)"
 readme = "README.md"
 requires-python = ">=3.9"

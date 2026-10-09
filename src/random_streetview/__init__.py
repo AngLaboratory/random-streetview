@@ -18,10 +18,11 @@ import json
 import random
 import re
 from typing import Callable, NamedTuple, Optional, Tuple
+from urllib.parse import quote
 
 import requests
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["Panorama", "random_panorama", "PLATFORMS"]
 
 # Per-request timeout: the default, and the floor any caller is held to.
@@ -34,8 +35,9 @@ _MIN_TIMEOUT = 0.5
 _TIMEOUT_BUDGET = 30.0
 
 _USER_AGENT = (
-    "random-streetview/0.2.0 "
-    "(+https://github.com/AngLaboratory/random-streetview)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
 )
 
 PLATFORMS = ("google", "naver", "kakao")
@@ -43,23 +45,38 @@ PLATFORMS = ("google", "naver", "kakao")
 # Google's panorama ids are always this long; anything else is a miss.
 _PANOID_LENGTH = 22
 
-# Undocumented internal Maps endpoint -- no API key, no guarantees.
-_SEARCH_URL = (
-    "https://maps.googleapis.com/maps/api/js/GeoPhotoService.SingleImageSearch"
-)
-
-# Picking a point at random mostly lands you in the ocean, so Google candidates
-# come from sites that keep their own lists of places known to have coverage.
-_RSV_URL = "https://randomstreetview.com/"
-_RSV_RE = re.compile(r"randomLocations\.all\s*=\s*(\[\{.*?\}\]);", re.S)
-
+# Google retired GeoPhotoService.SingleImageSearch (it now answers "...is
+# decommissioned and turned down."), so a coordinate can no longer be turned
+# into a panorama id that way. Instead we scrape a site that embeds a real
+# Street View panorama id directly, and confirm the id still resolves through
+# the live photometa metadata endpoint.
 _WANDERY_URL = (
     "https://www.wandery.it/random-street/random-streetview-lateral-thinking.php"
 )
-_WANDERY_RE = re.compile(r"!2m2!1d([-\d.]+)!2d([-\d.]+)", re.S)
+# The embedded Maps iframe carries the panoid then its coordinates:
+#   !1s<panoid>!2m2!1d<lat>!2d<lon>
+_WANDERY_RE = re.compile(
+    r"!1s([A-Za-z0-9_\-]{22})!2m2!1d([-\d.]+)!2d([-\d.]+)", re.S
+)
+
+# Live Google endpoint that returns metadata for a known panoid (no API key).
+# Used to confirm a scraped panorama still exists before handing it back. This
+# is the full pb Google's own viewer sends; a truncated one is rejected (400).
+_PHOTOMETA_URL = (
+    "https://www.google.com/maps/photometa/v1?authuser=0&hl=en&gl=us&pb="
+    "!1m4!1smaps_sv.tactile!11m2!2m1!1b1!2m2!1sen!2sus"
+    "!3m3!1m2!1e2!2s{panoid}"
+    "!4m57!1e1!1e2!1e4!1e1!1e1!1e1!1e1!1e1"
+    "!2m1!1e1!4m1!1i48!5m1!1e1!5m1!1e2!6m1!1e1!6m1!1e2"
+    "!9m36!1m3!1e6!2b0!3e0!1m3!1e6!2b0!3e1!1m3!1e6!2b0!3e2"
+    "!1m3!1e6!2b0!3e3!1m3!1e6!2b0!3e4!1m3!1e6!2b0!3e5"
+    "!1m3!1e6!2b0!3e6!1m3!1e6!2b0!3e7!1m3!1e6!2b0!3e8"
+)
+# photometa rejects requests without a google.com referer.
+_PHOTOMETA_REFERER = "https://www.google.com/"
 
 # Naver / Kakao cover South Korea, so their candidate coordinates are drawn
-# from inland Korea rather than the worldwide scraped lists.
+# from inland Korea.
 _NAVER_NEARBY_URL = "https://map.naver.com/p/api/panorama/nearby/{lon}/{lat}"
 _KAKAO_NODES_URL = (
     "https://rv.map.kakao.com/roadview-search/v2/nodes"
@@ -116,48 +133,53 @@ def _get(url: str, timeout: float, *, headers: Optional[dict] = None) -> Optiona
         return None
 
 
+# A found panorama: (panoid, lon, lat), or None on a miss. Each platform's
+# attempt function makes at most one round trip (or two for Google: scrape then
+# verify) and returns this.
+_Found = Optional[Tuple[str, float, float]]
+
+
 # --------------------------------------------------------------------------- #
-# Candidate coordinate sources
+# Google: scrape a real panoid, then confirm it still resolves
 # --------------------------------------------------------------------------- #
-def _from_randomstreetview(timeout: float) -> _LonLat:
-    body = _get(_RSV_URL, timeout)
-    if body is None:
-        return None, None
-
-    match = _RSV_RE.search(body)
-    if not match:
-        return None, None
-    try:
-        locations = json.loads(match.group(1))
-        point = random.choice(locations)
-        return float(point["lng"]), float(point["lat"])
-    except (ValueError, KeyError, TypeError, IndexError):
-        return None, None
+def _panoid_exists(panoid: str, timeout: float) -> bool:
+    """True if ``panoid`` still resolves through the live photometa endpoint."""
+    body = _get(
+        _PHOTOMETA_URL.format(panoid=quote(panoid)),
+        timeout,
+        headers={"Referer": _PHOTOMETA_REFERER},
+    )
+    if not body:
+        return False
+    # photometa replies with a ")]}'\n" guard then JSON; a valid pano echoes
+    # its own id back in the payload. A missing/retired pano does not.
+    return panoid in body
 
 
-def _from_wandery(timeout: float) -> _LonLat:
+def _google_attempt(timeout: float) -> _Found:
+    """Scrape wandery.it for an embedded panorama, verify it, and return it."""
     body = _get(_WANDERY_URL, timeout)
     if body is None:
-        return None, None
-
+        return None
     match = _WANDERY_RE.search(body)
     if not match:
-        return None, None
+        return None
+    panoid = match.group(1)
     try:
-        return float(match.group(2)), float(match.group(1))
+        lat, lon = float(match.group(2)), float(match.group(3))
     except ValueError:
-        return None, None
+        return None
+    if len(panoid) != _PANOID_LENGTH:
+        return None
+    if not _panoid_exists(panoid, timeout):
+        return None
+    return panoid, lon, lat
 
 
-def _random_lonlat_world(timeout: float) -> _LonLat:
-    for source in (_from_randomstreetview, _from_wandery):
-        lon, lat = source(timeout)
-        if lon is not None and lat is not None:
-            return lon, lat
-    return None, None
-
-
-def _random_lonlat_korea(timeout: float) -> _LonLat:
+# --------------------------------------------------------------------------- #
+# Naver / Kakao: random Korea coordinate -> that service's nearby endpoint
+# --------------------------------------------------------------------------- #
+def _random_lonlat_korea() -> _LonLat:
     """A random inland-Korea coordinate. Local, so it never touches the wire."""
     lat_min, lat_max, lon_min, lon_max, _weight = random.choices(
         _KOREA_BOXES, weights=[box[4] for box in _KOREA_BOXES], k=1
@@ -167,34 +189,8 @@ def _random_lonlat_korea(timeout: float) -> _LonLat:
     return lon, lat
 
 
-# --------------------------------------------------------------------------- #
-# Per-platform panoid resolution
-# --------------------------------------------------------------------------- #
-def _google_panoid(lon: float, lat: float, timeout: float) -> Optional[str]:
-    body = _get(
-        f"{_SEARCH_URL}?pb=!1m5!1sapiv3!5sUS!11m2!1m1!1b0"
-        f"!2m4!1m2!3d{lat}!4d{lon}!2d50!3m10"
-        "!2m2!1sen!2sGB!9m1!1e2!11m4!1m3!1e2!2b1!3e2!4m10!1e1!1e2!1e3!1e4"
-        "!1e8!1e6!5m1!1e2!6m1!1e2&callback=callbackfunc",
-        timeout,
-    )
-    if body is None:
-        return None
-
-    # The id is the first quoted string in the JSONP payload.
-    start = body.find('"')
-    end = body.find('"', start + 1) if start != -1 else -1
-    if start == -1 or end == -1:
-        return None
-
-    panoid = body[start + 1 : end]
-    # "generic" is what the endpoint returns when it has nothing to offer.
-    if panoid == "generic" or len(panoid) != _PANOID_LENGTH:
-        return None
-    return panoid
-
-
-def _naver_panoid(lon: float, lat: float, timeout: float) -> Optional[str]:
+def _naver_attempt(timeout: float) -> _Found:
+    lon, lat = _random_lonlat_korea()
     body = _get(
         _NAVER_NEARBY_URL.format(lon=lon, lat=lat),
         timeout,
@@ -206,13 +202,14 @@ def _naver_panoid(lon: float, lat: float, timeout: float) -> Optional[str]:
         features = json.loads(body).get("features")
         if not features:
             return None
-        panoid = features[0]["properties"]["id"]
+        panoid = str(features[0]["properties"]["id"])
     except (ValueError, KeyError, TypeError, IndexError):
         return None
-    return str(panoid) or None
+    return (panoid, lon, lat) if panoid else None
 
 
-def _kakao_panoid(lon: float, lat: float, timeout: float) -> Optional[str]:
+def _kakao_attempt(timeout: float) -> _Found:
+    lon, lat = _random_lonlat_korea()
     body = _get(
         _KAKAO_NODES_URL.format(lon=lon, lat=lat),
         timeout,
@@ -224,19 +221,18 @@ def _kakao_panoid(lon: float, lat: float, timeout: float) -> Optional[str]:
         street_view = json.loads(body).get("street_view")
         if not street_view or street_view.get("cnt", 0) == 0:
             return None
-        panoid = street_view["streetList"][0]["id"]
+        panoid = str(street_view["streetList"][0]["id"])
     except (ValueError, KeyError, TypeError, IndexError):
         return None
-    return str(panoid) or None
+    return (panoid, lon, lat) if panoid else None
 
 
-# platform -> (candidate coordinate source, panoid resolver)
-_Resolver = Callable[[float, float, float], Optional[str]]
-_CoordSource = Callable[[float], _LonLat]
-_PLATFORM_PIPELINE: dict = {
-    "google": (_random_lonlat_world, _google_panoid),
-    "naver": (_random_lonlat_korea, _naver_panoid),
-    "kakao": (_random_lonlat_korea, _kakao_panoid),
+# platform -> single-attempt function returning (panoid, lon, lat) or None.
+_Attempt = Callable[[float], _Found]
+_PLATFORM_ATTEMPT: dict = {
+    "google": _google_attempt,
+    "naver": _naver_attempt,
+    "kakao": _kakao_attempt,
 }
 
 
@@ -250,7 +246,8 @@ def random_panorama(
 
     ``platform`` selects the provider:
 
-    * ``"google"`` (default) -- a panorama from anywhere on Earth.
+    * ``"google"`` (default) -- a panorama from anywhere on Earth, scraped
+      from wandery.it and confirmed against Google's live metadata endpoint.
     * ``"naver"`` -- a road-view panorama from South Korea.
     * ``"kakao"`` -- a road-view panorama from South Korea.
 
@@ -263,7 +260,7 @@ def random_panorama(
     Returns ``None`` when the attempts are used up without a hit. Nothing here
     raises on a network or parsing failure.
     """
-    if platform not in _PLATFORM_PIPELINE:
+    if platform not in _PLATFORM_ATTEMPT:
         raise ValueError(
             "platform must be one of {}".format(", ".join(PLATFORMS))
         )
@@ -276,7 +273,7 @@ def random_panorama(
             "timeout must not exceed the {:.0f}s budget".format(_TIMEOUT_BUDGET)
         )
 
-    coord_source, resolve_panoid = _PLATFORM_PIPELINE[platform]
+    attempt = _PLATFORM_ATTEMPT[platform]
 
     budgeted = 0.0
     for _ in range(max_retry):
@@ -284,11 +281,9 @@ def random_panorama(
             break
         budgeted += timeout
 
-        lon, lat = coord_source(timeout)
-        if lon is None or lat is None:
-            continue
-        panoid = resolve_panoid(lon, lat, timeout)
-        if panoid is not None:
+        found = attempt(timeout)
+        if found is not None:
+            panoid, lon, lat = found
             return Panorama(panoid, lon, lat, platform)
 
     return None

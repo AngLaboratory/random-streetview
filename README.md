@@ -60,14 +60,16 @@ budget — only the timeouts do.
 
 ## How it works, and why it can break
 
-Picking a coordinate at random mostly lands you in the ocean, so candidates
-come from [randomstreetview.com][rsv] and [wandery.it][wandery], which keep
-lists of places known to have coverage. Each candidate is then resolved to a
-panorama id through `GeoPhotoService.SingleImageSearch`, an **undocumented
-internal Google Maps endpoint**.
+For Google, picking a coordinate at random mostly lands you in the ocean, and
+Google has retired the endpoint that used to turn a coordinate into a panorama
+id. So candidates are scraped from [wandery.it][wandery], which embeds real
+Street View panorama ids, and each one is confirmed through Google's
+`photometa` endpoint, an **undocumented internal Google Maps endpoint**. Naver
+and Kakao draw a random coordinate inside South Korea and ask that service's
+nearby-panorama endpoint, equally undocumented.
 
-That means no API key — and no guarantees. The scraped sites will change their
-HTML, and Google can alter or start refusing that endpoint at any time; when
+That means no API key — and no guarantees. The scraped site will change its
+HTML, and the providers can alter or start refusing those endpoints at any time; when
 that happens this library returns `None` rather than breaking your program. If
 you need something dependable, use the official
 [Street View Static API metadata endpoint][meta] with a key instead (metadata
@@ -86,6 +88,5 @@ uv run pytest    # fully offline; network calls are monkeypatched
 
 MIT
 
-[rsv]: https://randomstreetview.com/
 [wandery]: https://www.wandery.it/
 [meta]: https://developers.google.com/maps/documentation/streetview/metadata

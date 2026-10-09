@@ -7,9 +7,14 @@ import pytest
 import random_streetview as rsv
 from random_streetview import Panorama, random_panorama
 
-_RSV_BODY = 'var x; randomLocations.all = [{"lat":48.8584,"lng":2.2945}];'
-_WANDERY_BODY = "?pb=!2m2!1d48.8584!2d2.2945!3m1"
-_JSONP = 'callbackfunc([1,"ptFCsB5aFyaWDDlpbCliVw",[null]])'
+_PANO = "ptFCsB5aFyaWDDlpbCliVw"  # 22-char Google panoid
+# wandery.it embeds the panoid then its coords: !1s<id>!2m2!1d<lat>!2d<lon>
+_WANDERY_BODY = (
+    f'<iframe src="https://www.google.com/maps/embed?pb=!4v1!6m8!1m7'
+    f'!1s{_PANO}!2m2!1d48.8584!2d2.2945!3f0!4f0!5f0"></iframe>'
+)
+# photometa echoes the panoid back for a live pano.
+_PHOTOMETA_OK = ")]}'\n" + json.dumps([1, [[_PANO]]])
 
 _NAVER_BODY = json.dumps({"features": [{"properties": {"id": "naverPano123"}}]})
 _KAKAO_BODY = json.dumps(
@@ -55,7 +60,7 @@ def test_attempts_stop_at_the_budget(monkeypatch):
     attempts = []
 
     def fake_get(url, timeout, **kwargs):
-        if url.startswith("https://randomstreetview"):
+        if url.startswith(rsv._WANDERY_URL):
             attempts.append(url)
         return None
 
@@ -70,7 +75,7 @@ def test_defaults_reach_every_retry(monkeypatch):
     attempts = []
 
     def fake_get(url, timeout, **kwargs):
-        if url.startswith("https://randomstreetview"):
+        if url.startswith(rsv._WANDERY_URL):
             attempts.append(url)
         return None
 
@@ -81,25 +86,24 @@ def test_defaults_reach_every_retry(monkeypatch):
 
 def test_happy_path(monkeypatch):
     def fake_get(url, timeout, **kwargs):
-        return _RSV_BODY if url.startswith("https://randomstreetview") else _JSONP
-
-    monkeypatch.setattr(rsv, "_get", fake_get)
-    pano = random_panorama()
-    assert pano == Panorama("ptFCsB5aFyaWDDlpbCliVw", 2.2945, 48.8584, "google")
-
-
-def test_falls_back_to_the_second_source(monkeypatch):
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith("https://randomstreetview"):
-            return None
-        if url.startswith("https://www.wandery"):
+        if url.startswith(rsv._WANDERY_URL):
             return _WANDERY_BODY
-        return _JSONP
+        return _PHOTOMETA_OK  # photometa verify
 
     monkeypatch.setattr(rsv, "_get", fake_get)
     pano = random_panorama()
-    assert pano is not None
-    assert (pano.lon, pano.lat) == (2.2945, 48.8584)
+    assert pano == Panorama(_PANO, 2.2945, 48.8584, "google")
+
+
+def test_rejects_a_pano_that_no_longer_resolves(monkeypatch):
+    # wandery gives a panoid, but photometa does not echo it back -> retired.
+    def fake_get(url, timeout, **kwargs):
+        if url.startswith(rsv._WANDERY_URL):
+            return _WANDERY_BODY
+        return ")]}'\n[1,[[\"someOtherId000000000\"]]]"
+
+    monkeypatch.setattr(rsv, "_get", fake_get)
+    assert random_panorama(max_retry=2) is None
 
 
 def test_returns_none_when_everything_fails(monkeypatch):
@@ -107,31 +111,23 @@ def test_returns_none_when_everything_fails(monkeypatch):
     assert random_panorama(max_retry=3) is None
 
 
-def test_rejects_a_generic_panoid(monkeypatch):
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith("https://randomstreetview"):
-            return _RSV_BODY
-        return 'callbackfunc([1,"generic",[null]])'
-
-    monkeypatch.setattr(rsv, "_get", fake_get)
-    assert random_panorama(max_retry=2) is None
-
-
-def test_rejects_a_wrong_length_panoid(monkeypatch):
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith("https://randomstreetview"):
-            return _RSV_BODY
-        return 'callbackfunc([1,"tooshort",[null]])'
-
-    monkeypatch.setattr(rsv, "_get", fake_get)
-    assert random_panorama(max_retry=2) is None
-
-
 def test_survives_an_unparseable_source(monkeypatch):
     monkeypatch.setattr(
         rsv, "_get", lambda url, timeout, **kwargs: "not what we expected"
     )
     assert random_panorama(max_retry=2) is None
+
+
+def test_google_scrapes_wandery(monkeypatch):
+    seen = {}
+
+    def fake_get(url, timeout, **kwargs):
+        seen.setdefault("urls", []).append(url)
+        return None
+
+    monkeypatch.setattr(rsv, "_get", fake_get)
+    assert random_panorama(platform="google", max_retry=1) is None
+    assert any("wandery.it" in u for u in seen["urls"])
 
 
 def test_get_swallows_network_errors(monkeypatch):
