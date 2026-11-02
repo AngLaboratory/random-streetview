@@ -16,13 +16,11 @@ from __future__ import annotations
 
 import json
 import random
-import re
 from typing import Callable, NamedTuple, Optional, Tuple
-from urllib.parse import quote
 
 import requests
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 __all__ = ["Panorama", "random_panorama", "PLATFORMS"]
 
 # Per-request timeout: the default, and the floor any caller is held to.
@@ -45,35 +43,50 @@ PLATFORMS = ("google", "naver", "kakao")
 # Google's panorama ids are always this long; anything else is a miss.
 _PANOID_LENGTH = 22
 
-# Google retired GeoPhotoService.SingleImageSearch (it now answers "...is
-# decommissioned and turned down."), so a coordinate can no longer be turned
-# into a panorama id that way. Instead we scrape a site that embeds a real
-# Street View panorama id directly, and confirm the id still resolves through
-# the live photometa metadata endpoint.
-_WANDERY_URL = (
-    "https://www.wandery.it/random-street/random-streetview-lateral-thinking.php"
+# Google retired the old GET form of GeoPhotoService.SingleImageSearch (it now
+# answers "...is decommissioned and turned down."), but the same search lives
+# on at a MapsJSInternalService RPC that takes a POST body and needs no API
+# key. We draw our own random worldwide land coordinate and ask this endpoint
+# for the nearest panorama, so the distribution is ours to control rather than
+# whatever a third-party site happens to serve.
+_SINGLE_IMAGE_SEARCH_URL = (
+    "https://maps.googleapis.com/$rpc/"
+    "google.internal.maps.mapsjs.v1.MapsJsInternalService/SingleImageSearch"
 )
-# The embedded Maps iframe carries the panoid then its coordinates:
-#   !1s<panoid>!2m2!1d<lat>!2d<lon>
-_WANDERY_RE = re.compile(
-    r"!1s([A-Za-z0-9_\-]{22})!2m2!1d([-\d.]+)!2d([-\d.]+)", re.S
-)
+_SINGLE_IMAGE_SEARCH_CONTENT_TYPE = "application/json+protobuf"
 
-# Live Google endpoint that returns metadata for a known panoid (no API key).
-# Used to confirm a scraped panorama still exists before handing it back. This
-# is the full pb Google's own viewer sends; a truncated one is rejected (400).
-_PHOTOMETA_URL = (
-    "https://www.google.com/maps/photometa/v1?authuser=0&hl=en&gl=us&pb="
-    "!1m4!1smaps_sv.tactile!11m2!2m1!1b1!2m2!1sen!2sus"
-    "!3m3!1m2!1e2!2s{panoid}"
-    "!4m57!1e1!1e2!1e4!1e1!1e1!1e1!1e1!1e1"
-    "!2m1!1e1!4m1!1i48!5m1!1e1!5m1!1e2!6m1!1e1!6m1!1e2"
-    "!9m36!1m3!1e6!2b0!3e0!1m3!1e6!2b0!3e1!1m3!1e6!2b0!3e2"
-    "!1m3!1e6!2b0!3e3!1m3!1e6!2b0!3e4!1m3!1e6!2b0!3e5"
-    "!1m3!1e6!2b0!3e6!1m3!1e6!2b0!3e7!1m3!1e6!2b0!3e8"
+# How far from the drawn coordinate the endpoint may snap to a panorama. A wide
+# radius turns a near-miss on an empty box into a hit on a nearby road.
+_GOOGLE_SEARCH_RADIUS_M = 15000.0
+
+# Weighted worldwide latitude/longitude boxes with dense Street View coverage.
+# Weights are rough land-area/coverage proportions so a draw is spread across
+# the globe instead of piling up in any one country.
+#   (lat_min, lat_max, lon_min, lon_max, weight)
+_WORLD_BOXES = (
+    (26.0, 52.0, -124.0, -74.0, 7.0),     # contiguous USA
+    (35.0, 60.0, -6.0, 53.0, 11.0),       # Europe / Turkey / western Russia
+    (-25.0, -3.0, -71.0, -39.0, 7.5),     # central Brazil / Bolivia / Paraguay
+    (-36.0, -18.0, 133.0, 152.0, 3.5),    # eastern Australia
+    (20.0, 28.0, 68.0, 109.0, 3.5),       # northern India / Bangladesh / southern China
+    (-34.0, -17.0, 15.0, 33.0, 3.0),      # southern Africa
+    (-40.0, -25.0, -73.0, -51.0, 3.0),    # central Chile / Argentina / Uruguay / S. Brazil
+    (-2.0, 20.0, 98.0, 106.0, 2.0),       # Thailand / Indochina / Malay Peninsula
+    (51.0, 58.0, 53.0, 95.0, 2.0),        # southern Siberia / northern Kazakhstan
+    (4.0, 13.0, -4.0, 12.0, 1.5),         # West Africa (Ghana / Nigeria)
+    (60.0, 70.0, 8.0, 36.0, 1.5),         # northern Scandinavia / Finland
+    (-35.0, -20.0, 114.0, 122.0, 1.0),    # southwestern Australia
+    (8.0, 20.0, 72.0, 81.0, 1.0),         # southern India
+    (-4.0, 3.0, 108.0, 123.0, 1.0),       # Borneo / Sulawesi
+    (45.0, 51.0, 91.0, 117.0, 1.0),       # Mongolia
+    (52.0, 57.0, -133.0, -98.0, 1.0),     # western Canada (prairies / BC)
+    (-4.0, 4.0, 29.0, 41.0, 1.0),         # East Africa (Kenya / Uganda)
+    (23.0, 27.0, 32.0, 58.0, 1.0),        # Egypt / Saudi Arabia / UAE band
+    (16.0, 26.0, -106.0, -96.0, 1.0),     # central Mexico
+    (28.0, 36.0, 68.0, 80.0, 1.0),        # Pakistan / northwestern India
+    (-53.0, -40.0, -74.0, -65.0, 1.0),    # Patagonia
+    (32.0, 38.0, 125.0, 141.0, 1.0),      # Korea / Japan (Seoul–Tokyo band)
 )
-# photometa rejects requests without a google.com referer.
-_PHOTOMETA_REFERER = "https://www.google.com/"
 
 # Naver / Kakao cover South Korea, so their candidate coordinates are drawn
 # from inland Korea.
@@ -133,47 +146,101 @@ def _get(url: str, timeout: float, *, headers: Optional[dict] = None) -> Optiona
         return None
 
 
+def _post(
+    url: str, data: str, timeout: float, *, headers: Optional[dict] = None
+) -> Optional[str]:
+    hdrs = {"User-Agent": _USER_AGENT}
+    if headers:
+        hdrs.update(headers)
+    try:
+        response = requests.post(url, data=data, headers=hdrs, timeout=timeout)
+        response.raise_for_status()
+        return response.text
+    except Exception:
+        return None
+
+
 # A found panorama: (panoid, lon, lat), or None on a miss. Each platform's
-# attempt function makes at most one round trip (or two for Google: scrape then
-# verify) and returns this.
+# attempt function makes a single round trip and returns this.
 _Found = Optional[Tuple[str, float, float]]
 
 
 # --------------------------------------------------------------------------- #
-# Google: scrape a real panoid, then confirm it still resolves
+# Google: random worldwide coordinate -> nearest panorama via SingleImageSearch
 # --------------------------------------------------------------------------- #
-def _panoid_exists(panoid: str, timeout: float) -> bool:
-    """True if ``panoid`` still resolves through the live photometa endpoint."""
-    body = _get(
-        _PHOTOMETA_URL.format(panoid=quote(panoid)),
-        timeout,
-        headers={"Referer": _PHOTOMETA_REFERER},
-    )
-    if not body:
-        return False
-    # photometa replies with a ")]}'\n" guard then JSON; a valid pano echoes
-    # its own id back in the payload. A missing/retired pano does not.
-    return panoid in body
+def _random_lonlat_world() -> _LonLat:
+    """A random land coordinate. Local, so it never touches the wire."""
+    lat_min, lat_max, lon_min, lon_max, _weight = random.choices(
+        _WORLD_BOXES, weights=[box[4] for box in _WORLD_BOXES], k=1
+    )[0]
+    lat = round(random.uniform(lat_min, lat_max), 7)
+    lon = round(random.uniform(lon_min, lon_max), 7)
+    return lon, lat
 
 
-def _google_attempt(timeout: float) -> _Found:
-    """Scrape wandery.it for an embedded panorama, verify it, and return it."""
-    body = _get(_WANDERY_URL, timeout)
-    if body is None:
-        return None
-    match = _WANDERY_RE.search(body)
-    if not match:
-        return None
-    panoid = match.group(1)
+def _single_image_search_body(lat: float, lon: float) -> str:
+    """The json+protobuf POST body SingleImageSearch expects for a radius query.
+
+    Mirrors the message the Maps JS client sends: an ``apiv3`` header, the
+    query point with a search radius, a locale/image-type block (image type 2
+    is first-party Google Street View), and a toggle list selecting which
+    metadata to return.
+    """
+    message = [
+        ["apiv3", None, None, None, "US"],
+        [[None, None, lat, lon], _GOOGLE_SEARCH_RADIUS_M],
+        [
+            None,
+            ["en", "US"],
+            None, None, None, None, None, None,
+            [2],
+            None,
+            [[[2, True, 2]]],
+        ],
+        [[1, 2, 3, 4, 6, 8, 12], None, None, None, [], []],
+    ]
+    return json.dumps(message)
+
+
+def _parse_single_image_search(body: str) -> _Found:
+    """Pull (panoid, lon, lat) out of a SingleImageSearch response, or None.
+
+    A successful radius search answers ``[0, <pano message>, ...]``; an empty
+    one answers ``[[5, "generic", "Search returned no images."]]``. The panoid
+    lives at ``msg[1][1]`` and its coordinates at ``msg[5][0][1][0][2:4]``.
+    """
     try:
-        lat, lon = float(match.group(2)), float(match.group(3))
+        data = json.loads(body)
     except ValueError:
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], list):
+        return None
+    if data[0][0] != 0:  # 0 == OK; 5 == no images; anything else == not a hit
+        return None
+    try:
+        msg = data[1]
+        panoid = str(msg[1][1])
+        lat = float(msg[5][0][1][0][2])
+        lon = float(msg[5][0][1][0][3])
+    except (IndexError, KeyError, TypeError, ValueError):
         return None
     if len(panoid) != _PANOID_LENGTH:
         return None
-    if not _panoid_exists(panoid, timeout):
-        return None
     return panoid, lon, lat
+
+
+def _google_attempt(timeout: float) -> _Found:
+    """Draw a random coordinate and return the nearest Google panorama to it."""
+    lon, lat = _random_lonlat_world()
+    body = _post(
+        _SINGLE_IMAGE_SEARCH_URL,
+        _single_image_search_body(lat, lon),
+        timeout,
+        headers={"Content-Type": _SINGLE_IMAGE_SEARCH_CONTENT_TYPE},
+    )
+    if body is None:
+        return None
+    return _parse_single_image_search(body)
 
 
 # --------------------------------------------------------------------------- #
@@ -246,8 +313,8 @@ def random_panorama(
 
     ``platform`` selects the provider:
 
-    * ``"google"`` (default) -- a panorama from anywhere on Earth, scraped
-      from wandery.it and confirmed against Google's live metadata endpoint.
+    * ``"google"`` (default) -- a panorama from anywhere on Earth: a random
+      land coordinate snapped to its nearest Street View panorama.
     * ``"naver"`` -- a road-view panorama from South Korea.
     * ``"kakao"`` -- a road-view panorama from South Korea.
 

@@ -8,13 +8,26 @@ import random_streetview as rsv
 from random_streetview import Panorama, random_panorama
 
 _PANO = "ptFCsB5aFyaWDDlpbCliVw"  # 22-char Google panoid
-# wandery.it embeds the panoid then its coords: !1s<id>!2m2!1d<lat>!2d<lon>
-_WANDERY_BODY = (
-    f'<iframe src="https://www.google.com/maps/embed?pb=!4v1!6m8!1m7'
-    f'!1s{_PANO}!2m2!1d48.8584!2d2.2945!3f0!4f0!5f0"></iframe>'
-)
-# photometa echoes the panoid back for a live pano.
-_PHOTOMETA_OK = ")]}'\n" + json.dumps([1, [[_PANO]]])
+
+
+def _single_image_search_hit(panoid=_PANO, lat=48.8584, lon=2.2945):
+    """A minimal SingleImageSearch 'OK' body carrying one panorama.
+
+    Shape mirrors the real response the parser walks:
+    data[0] == [0] (OK), panoid at data[1][1][1], coords at
+    data[1][5][0][1][0][2:4].
+    """
+    msg = [
+        None,
+        [2, panoid],
+        None, None, None,
+        [[None, [[None, None, lat, lon]]]],
+    ]
+    return json.dumps([[0], msg])
+
+
+# The empty-result body Google returns when nothing is in range.
+_SINGLE_IMAGE_SEARCH_EMPTY = json.dumps([[5, "generic", "Search returned no images."]])
 
 _NAVER_BODY = json.dumps({"features": [{"properties": {"id": "naverPano123"}}]})
 _KAKAO_BODY = json.dumps(
@@ -42,11 +55,11 @@ def test_unknown_platform_is_rejected():
 def test_timeout_is_raised_to_the_floor(monkeypatch):
     seen = []
 
-    def fake_get(url, timeout, **kwargs):
+    def fake_post(url, data, timeout, **kwargs):
         seen.append(timeout)
         return None
 
-    monkeypatch.setattr(rsv, "_get", fake_get)
+    monkeypatch.setattr(rsv, "_post", fake_post)
     random_panorama(max_retry=1, timeout=0.01)
     assert seen and all(t == rsv._MIN_TIMEOUT for t in seen)
 
@@ -59,12 +72,11 @@ def test_timeout_larger_than_the_budget_is_rejected():
 def test_attempts_stop_at_the_budget(monkeypatch):
     attempts = []
 
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith(rsv._WANDERY_URL):
-            attempts.append(url)
+    def fake_post(url, data, timeout, **kwargs):
+        attempts.append(url)
         return None
 
-    monkeypatch.setattr(rsv, "_get", fake_get)
+    monkeypatch.setattr(rsv, "_post", fake_post)
     # 10s per request leaves room for 3 attempts inside the 30s budget,
     # not the 10 that max_retry asks for.
     assert random_panorama(max_retry=10, timeout=10.0) is None
@@ -74,60 +86,76 @@ def test_attempts_stop_at_the_budget(monkeypatch):
 def test_defaults_reach_every_retry(monkeypatch):
     attempts = []
 
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith(rsv._WANDERY_URL):
-            attempts.append(url)
+    def fake_post(url, data, timeout, **kwargs):
+        attempts.append(url)
         return None
 
-    monkeypatch.setattr(rsv, "_get", fake_get)
+    monkeypatch.setattr(rsv, "_post", fake_post)
     assert random_panorama() is None
     assert len(attempts) == 10
 
 
 def test_happy_path(monkeypatch):
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith(rsv._WANDERY_URL):
-            return _WANDERY_BODY
-        return _PHOTOMETA_OK  # photometa verify
+    def fake_post(url, data, timeout, **kwargs):
+        return _single_image_search_hit()
 
-    monkeypatch.setattr(rsv, "_get", fake_get)
+    monkeypatch.setattr(rsv, "_post", fake_post)
     pano = random_panorama()
     assert pano == Panorama(_PANO, 2.2945, 48.8584, "google")
 
 
-def test_rejects_a_pano_that_no_longer_resolves(monkeypatch):
-    # wandery gives a panoid, but photometa does not echo it back -> retired.
-    def fake_get(url, timeout, **kwargs):
-        if url.startswith(rsv._WANDERY_URL):
-            return _WANDERY_BODY
-        return ")]}'\n[1,[[\"someOtherId000000000\"]]]"
-
-    monkeypatch.setattr(rsv, "_get", fake_get)
+def test_skips_boxes_with_no_coverage(monkeypatch):
+    # The endpoint reports no images; the call exhausts its retries and gives up.
+    monkeypatch.setattr(
+        rsv, "_post", lambda url, data, timeout, **kwargs: _SINGLE_IMAGE_SEARCH_EMPTY
+    )
     assert random_panorama(max_retry=2) is None
 
 
 def test_returns_none_when_everything_fails(monkeypatch):
-    monkeypatch.setattr(rsv, "_get", lambda url, timeout, **kwargs: None)
+    monkeypatch.setattr(rsv, "_post", lambda url, data, timeout, **kwargs: None)
     assert random_panorama(max_retry=3) is None
 
 
 def test_survives_an_unparseable_source(monkeypatch):
     monkeypatch.setattr(
-        rsv, "_get", lambda url, timeout, **kwargs: "not what we expected"
+        rsv, "_post", lambda url, data, timeout, **kwargs: "not what we expected"
     )
     assert random_panorama(max_retry=2) is None
 
 
-def test_google_scrapes_wandery(monkeypatch):
+def test_google_queries_single_image_search(monkeypatch):
     seen = {}
 
-    def fake_get(url, timeout, **kwargs):
-        seen.setdefault("urls", []).append(url)
+    def fake_post(url, data, timeout, **kwargs):
+        seen["url"] = url
+        seen["data"] = data
         return None
 
-    monkeypatch.setattr(rsv, "_get", fake_get)
+    monkeypatch.setattr(rsv, "_post", fake_post)
     assert random_panorama(platform="google", max_retry=1) is None
-    assert any("wandery.it" in u for u in seen["urls"])
+    assert seen["url"] == rsv._SINGLE_IMAGE_SEARCH_URL
+    # The body is json+protobuf carrying the search radius.
+    assert str(rsv._GOOGLE_SEARCH_RADIUS_M) in seen["data"]
+
+
+def test_google_coordinates_come_from_world_boxes(monkeypatch):
+    captured = {}
+
+    def fake_body(lat, lon):
+        captured["lat"] = lat
+        captured["lon"] = lon
+        return "{}"
+
+    monkeypatch.setattr(rsv, "_single_image_search_body", fake_body)
+    monkeypatch.setattr(rsv, "_post", lambda *a, **k: None)
+    random_panorama(platform="google", max_retry=1)
+    lat, lon = captured["lat"], captured["lon"]
+    # Every drawn point must fall inside one of the declared world boxes.
+    assert any(
+        lo_lat <= lat <= hi_lat and lo_lon <= lon <= hi_lon
+        for lo_lat, hi_lat, lo_lon, hi_lon, _w in rsv._WORLD_BOXES
+    )
 
 
 def test_get_swallows_network_errors(monkeypatch):
@@ -136,6 +164,14 @@ def test_get_swallows_network_errors(monkeypatch):
 
     monkeypatch.setattr(rsv.requests, "get", boom)
     assert rsv._get("https://example.com", 1.0) is None
+
+
+def test_post_swallows_network_errors(monkeypatch):
+    def boom(*args, **kwargs):
+        raise OSError("no network")
+
+    monkeypatch.setattr(rsv.requests, "post", boom)
+    assert rsv._post("https://example.com", "{}", 1.0) is None
 
 
 # --------------------------------------------------------------------------- #

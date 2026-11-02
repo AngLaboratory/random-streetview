@@ -60,20 +60,25 @@ budget — only the timeouts do.
 
 ## How it works, and why it can break
 
-For Google, picking a coordinate at random mostly lands you in the ocean, and
-Google has retired the endpoint that used to turn a coordinate into a panorama
-id. So candidates are scraped from [wandery.it][wandery], which embeds real
-Street View panorama ids, and each one is confirmed through Google's
-`photometa` endpoint, an **undocumented internal Google Maps endpoint**. Naver
-and Kakao draw a random coordinate inside South Korea and ask that service's
-nearby-panorama endpoint, equally undocumented.
+For Google, a call draws a random coordinate from a set of weighted
+latitude/longitude boxes that cover land with dense Street View coverage, then
+asks Google's internal `SingleImageSearch` endpoint for the nearest panorama to
+it. If the draw lands somewhere with no coverage the endpoint says so and the
+call simply tries again, up to `max_retry` times. Naver and Kakao work the same
+way but draw from inland South Korea and hit each service's own
+nearby-panorama endpoint.
 
-That means no API key — and no guarantees. The scraped site will change its
-HTML, and the providers can alter or start refusing those endpoints at any time; when
-that happens this library returns `None` rather than breaking your program. If
-you need something dependable, use the official
-[Street View Static API metadata endpoint][meta] with a key instead (metadata
-requests are not billed).
+The boxes are weighted so the result is spread across the globe instead of
+piling up in any one country:
+
+![Street View coverage boxes used for the worldwide Google search](docs/coverage-boxes.png)
+
+All three endpoints are **undocumented internal map endpoints** hit without an
+API key — so there are no guarantees. A provider can change the response
+format or start refusing these calls at any time; when that happens this
+library returns `None` rather than breaking your program. If you need something
+dependable, use the official [Street View Static API metadata endpoint][meta]
+with a key instead (metadata requests are not billed).
 
 Requests are not rate-limited for you. Space out your calls.
 
@@ -88,5 +93,4 @@ uv run pytest    # fully offline; network calls are monkeypatched
 
 MIT
 
-[wandery]: https://www.wandery.it/
 [meta]: https://developers.google.com/maps/documentation/streetview/metadata
